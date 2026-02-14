@@ -109,18 +109,26 @@ static void test_certification_declarations(void) {
             "cert echo_client declaration");
   check_int(strstr(raw, "\"holon_rpc_client\": \"./bin/holon-rpc-client\"") != NULL,
             "cert holon_rpc_client declaration");
+  check_int(strstr(raw, "\"holon_rpc_server\": \"./bin/holon-rpc-server\"") != NULL,
+            "cert holon_rpc_server declaration");
   check_int(strstr(raw, "\"grpc_dial_tcp\": true") != NULL, "cert grpc_dial_tcp declaration");
   check_int(strstr(raw, "\"grpc_dial_stdio\": true") != NULL, "cert grpc_dial_stdio declaration");
+  check_int(strstr(raw, "\"grpc_dial_ws\": true") != NULL, "cert grpc_dial_ws declaration");
   check_int(strstr(raw, "\"holon_rpc_client\": true") != NULL, "cert holon_rpc_client capability");
+  check_int(strstr(raw, "\"holon_rpc_server\": true") != NULL, "cert holon_rpc_server capability");
+  check_int(strstr(raw, "\"bidirectional\": true") != NULL, "cert bidirectional capability");
+  check_int(strstr(raw, "\"valence\": \"multi\"") != NULL, "cert valence declaration");
 }
 
 static void test_echo_scripts_exist(void) {
   check_int(access("./bin/echo-client", F_OK) == 0, "echo-client script exists");
   check_int(access("./bin/echo-server", F_OK) == 0, "echo-server script exists");
   check_int(access("./bin/holon-rpc-client", F_OK) == 0, "holon-rpc-client script exists");
+  check_int(access("./bin/holon-rpc-server", F_OK) == 0, "holon-rpc-server script exists");
   check_int(access("./bin/echo-client", X_OK) == 0, "echo-client script executable");
   check_int(access("./bin/echo-server", X_OK) == 0, "echo-server script executable");
   check_int(access("./bin/holon-rpc-client", X_OK) == 0, "holon-rpc-client script executable");
+  check_int(access("./bin/holon-rpc-server", X_OK) == 0, "holon-rpc-server script executable");
 }
 
 static void test_echo_wrapper_invocation(void) {
@@ -209,7 +217,7 @@ static void test_echo_wrapper_invocation(void) {
     check_int(strstr(capture, "PWD=") != NULL && strstr(capture, "/sdk/go-holons") != NULL,
               "echo-client wrapper cwd");
     check_int(strstr(capture, "ARG0=run") != NULL, "echo-client wrapper uses go run");
-    check_int(strstr(capture, "echo-client-go/main.go") != NULL, "echo-client wrapper helper path");
+    check_int(strstr(capture, "go_echo_client.go") != NULL, "echo-client wrapper helper path");
     check_int(strstr(capture, "--sdk") != NULL && strstr(capture, "c-holons") != NULL,
               "echo-client wrapper sdk default");
     check_int(strstr(capture, "--server-sdk") != NULL && strstr(capture, "go-holons") != NULL,
@@ -271,6 +279,23 @@ static void test_echo_wrapper_invocation(void) {
               "holon-rpc-client wrapper forwards URI");
     check_int(strstr(capture, "--connect-only") != NULL,
               "holon-rpc-client wrapper forwards connect-only");
+  }
+
+  capture[0] = '\0';
+  exit_code = command_exit_code("./bin/holon-rpc-server ws://127.0.0.1:8080/rpc >/dev/null 2>&1");
+  check_int(exit_code == 0, "holon-rpc-server wrapper exit");
+  check_int(read_file(fake_log, capture, sizeof(capture)) == 0,
+            "read holon-rpc-server wrapper capture");
+  if (capture[0] != '\0') {
+    check_int(strstr(capture, "PWD=") != NULL && strstr(capture, "/sdk/go-holons") != NULL,
+              "holon-rpc-server wrapper cwd");
+    check_int(strstr(capture, "ARG0=run") != NULL, "holon-rpc-server wrapper uses go run");
+    check_int(strstr(capture, "go_holonrpc_server.go") != NULL,
+              "holon-rpc-server wrapper helper path");
+    check_int(strstr(capture, "--sdk") != NULL && strstr(capture, "c-holons") != NULL,
+              "holon-rpc-server wrapper sdk default");
+    check_int(strstr(capture, "ws://127.0.0.1:8080/rpc") != NULL,
+              "holon-rpc-server wrapper forwards URI");
   }
 
   unlink(fake_go);
@@ -608,7 +633,7 @@ static void test_cross_language_go_holonrpc(void) {
 
     snprintf(server_cmd,
              sizeof(server_cmd),
-             "cd ../go-holons && '%s' run '%s' 2>/dev/null",
+             "cd ../go-holons && '%s' run '%s' --once 2>/dev/null",
              go_bin,
              helper);
 

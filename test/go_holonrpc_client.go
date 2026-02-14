@@ -3,13 +3,14 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
 	"strings"
 	"time"
 
-	"nhooyr.io/websocket"
+	"github.com/Organic-Programming/go-holons/pkg/holonrpc"
 )
 
 const (
@@ -20,30 +21,16 @@ const (
 	defaultTimeoutMS = 5000
 )
 
-type rpcError struct {
-	Code    int         `json:"code"`
-	Message string      `json:"message"`
-	Data    interface{} `json:"data,omitempty"`
-}
-
-type rpcMessage struct {
-	JSONRPC string                 `json:"jsonrpc,omitempty"`
-	ID      interface{}            `json:"id,omitempty"`
-	Method  string                 `json:"method,omitempty"`
-	Params  map[string]interface{} `json:"params,omitempty"`
-	Result  map[string]interface{} `json:"result,omitempty"`
-	Error   *rpcError              `json:"error,omitempty"`
-}
-
 type options struct {
 	url              string
 	sdk              string
 	serverSDK        string
 	method           string
-	params           map[string]interface{}
+	params           map[string]any
 	expectedErrorIDs []int
 	timeoutMS        int
 	connectOnly      bool
+	bidirectional    bool
 }
 
 func main() {
@@ -58,26 +45,35 @@ func main() {
 		timeout = defaultTimeoutMS * time.Millisecond
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
 	startedAt := time.Now()
 
-	conn, _, err := websocket.Dial(ctx, args.url, &websocket.DialOptions{Subprotocols: []string{"holon-rpc"}})
+	client := holonrpc.NewClient()
+	if args.bidirectional {
+		client.Register("client.v1.Client/Hello", func(_ context.Context, params map[string]any) (map[string]any, error) {
+			name := "unknown"
+			if rawName, ok := params["name"].(string); ok {
+				trimmed := strings.TrimSpace(rawName)
+				if trimmed != "" {
+					name = trimmed
+				}
+			}
+			return map[string]any{"message": "pong:" + name}, nil
+		})
+	}
+
+	connectCtx, connectCancel := context.WithTimeout(context.Background(), timeout)
+	err = client.Connect(connectCtx, args.url)
+	connectCancel()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "dial failed: %v\n", err)
 		os.Exit(1)
 	}
-	defer conn.Close(websocket.StatusNormalClosure, "done")
-
-	if conn.Subprotocol() != "holon-rpc" {
-		_ = conn.Close(websocket.StatusProtocolError, "missing holon-rpc subprotocol")
-		fmt.Fprintln(os.Stderr, "server did not negotiate holon-rpc")
-		os.Exit(1)
-	}
+	defer func() {
+		_ = client.Close()
+	}()
 
 	if args.connectOnly {
-		mustWriteJSON(map[string]interface{}{
+		mustWriteJSON(map[string]any{
 			"status":     "pass",
 			"sdk":        args.sdk,
 			"server_sdk": args.serverSDK,
@@ -87,59 +83,27 @@ func main() {
 		return
 	}
 
-	req := rpcMessage{
-		JSONRPC: "2.0",
-		ID:      "c1",
-		Method:  args.method,
-		Params:  args.params,
+	if args.bidirectional {
+		runBidirectional(client, args, startedAt, timeout)
+		return
 	}
 
-	payload, err := json.Marshal(req)
+	invokeCtx, invokeCancel := context.WithTimeout(context.Background(), timeout)
+	out, err := client.Invoke(invokeCtx, args.method, args.params)
+	invokeCancel()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "encode request failed: %v\n", err)
-		os.Exit(1)
-	}
-
-	if err := conn.Write(ctx, websocket.MessageText, payload); err != nil {
-		fmt.Fprintf(os.Stderr, "write failed: %v\n", err)
-		os.Exit(1)
-	}
-
-	_, respData, err := conn.Read(ctx)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "read failed: %v\n", err)
-		os.Exit(1)
-	}
-
-	var resp rpcMessage
-	if err := json.Unmarshal(respData, &resp); err != nil {
-		fmt.Fprintf(os.Stderr, "decode response failed: %v\n", err)
-		os.Exit(1)
-	}
-
-	if resp.JSONRPC != "2.0" {
-		fmt.Fprintf(os.Stderr, "unexpected jsonrpc version: %q\n", resp.JSONRPC)
-		os.Exit(1)
-	}
-	if fmt.Sprint(resp.ID) != fmt.Sprint(req.ID) {
-		fmt.Fprintf(os.Stderr, "unexpected response id: %v\n", resp.ID)
-		os.Exit(1)
-	}
-
-	if resp.Error != nil {
-		if containsInt(args.expectedErrorIDs, resp.Error.Code) {
-			mustWriteJSON(map[string]interface{}{
+		if code, ok := rpcErrorCode(err); ok && containsInt(args.expectedErrorIDs, code) {
+			mustWriteJSON(map[string]any{
 				"status":     "pass",
 				"sdk":        args.sdk,
 				"server_sdk": args.serverSDK,
 				"latency_ms": time.Since(startedAt).Milliseconds(),
 				"method":     args.method,
-				"error_code": resp.Error.Code,
+				"error_code": code,
 			})
 			return
 		}
-
-		fmt.Fprintf(os.Stderr, "rpc error: %d %s\n", resp.Error.Code, resp.Error.Message)
+		fmt.Fprintf(os.Stderr, "invoke failed: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -150,14 +114,14 @@ func main() {
 
 	if args.method == defaultMethod {
 		expected := fmt.Sprint(args.params["message"])
-		actual := fmt.Sprint(resp.Result["message"])
+		actual := fmt.Sprint(out["message"])
 		if actual != expected {
-			fmt.Fprintf(os.Stderr, "unexpected echo response: %s\n", string(respData))
+			fmt.Fprintf(os.Stderr, "unexpected echo response: %v\n", out)
 			os.Exit(1)
 		}
 	}
 
-	mustWriteJSON(map[string]interface{}{
+	mustWriteJSON(map[string]any{
 		"status":     "pass",
 		"sdk":        args.sdk,
 		"server_sdk": args.serverSDK,
@@ -166,10 +130,54 @@ func main() {
 	})
 }
 
+func runBidirectional(client *holonrpc.Client, args options, startedAt time.Time, timeout time.Duration) {
+	echoMessage := fmt.Sprint(args.params["message"])
+	if strings.TrimSpace(echoMessage) == "" || echoMessage == "<nil>" {
+		echoMessage = "interop-bidi"
+	}
+
+	echoCtx, echoCancel := context.WithTimeout(context.Background(), timeout)
+	echoOut, err := client.Invoke(echoCtx, "echo.v1.Echo/Ping", map[string]any{"message": echoMessage})
+	echoCancel()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "bidi echo invoke failed: %v\n", err)
+		os.Exit(1)
+	}
+	if got := fmt.Sprint(echoOut["message"]); got != echoMessage {
+		fmt.Fprintf(os.Stderr, "bidi echo mismatch: got=%q want=%q\n", got, echoMessage)
+		os.Exit(1)
+	}
+
+	callbackCtx, callbackCancel := context.WithTimeout(context.Background(), timeout)
+	callbackOut, err := client.Invoke(callbackCtx, "echo.v1.Echo/CallClient", map[string]any{"name": "from-go"})
+	callbackCancel()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "bidi callback invoke failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	callbackMessage := fmt.Sprint(callbackOut["message"])
+	if callbackMessage != "pong:from-go" {
+		fmt.Fprintf(os.Stderr, "bidi callback mismatch: got=%q want=%q\n", callbackMessage, "pong:from-go")
+		os.Exit(1)
+	}
+
+	mustWriteJSON(map[string]any{
+		"status":           "pass",
+		"sdk":              args.sdk,
+		"server_sdk":       args.serverSDK,
+		"latency_ms":       time.Since(startedAt).Milliseconds(),
+		"check":            "bidi",
+		"echo_message":     echoMessage,
+		"callback_message": callbackMessage,
+	})
+}
+
 func parseFlags() (options, error) {
 	var out options
 	var paramsJSON string
 	var expectError string
+
 	out.sdk = defaultSDK
 	out.serverSDK = defaultServerSDK
 	out.method = defaultMethod
@@ -179,11 +187,14 @@ func parseFlags() (options, error) {
 	for i := 0; i < len(args); i++ {
 		token := args[i]
 
-		if token == "--connect-only" {
+		switch token {
+		case "--connect-only":
 			out.connectOnly = true
 			continue
-		}
-		if token == "--sdk" {
+		case "--bidirectional":
+			out.bidirectional = true
+			continue
+		case "--sdk":
 			value, err := requireValue(args, i, "--sdk")
 			if err != nil {
 				return options{}, err
@@ -191,8 +202,7 @@ func parseFlags() (options, error) {
 			out.sdk = value
 			i++
 			continue
-		}
-		if token == "--server-sdk" {
+		case "--server-sdk":
 			value, err := requireValue(args, i, "--server-sdk")
 			if err != nil {
 				return options{}, err
@@ -200,8 +210,7 @@ func parseFlags() (options, error) {
 			out.serverSDK = value
 			i++
 			continue
-		}
-		if token == "--method" {
+		case "--method":
 			value, err := requireValue(args, i, "--method")
 			if err != nil {
 				return options{}, err
@@ -209,17 +218,15 @@ func parseFlags() (options, error) {
 			out.method = value
 			i++
 			continue
-		}
-		if token == "--message" {
+		case "--message":
 			value, err := requireValue(args, i, "--message")
 			if err != nil {
 				return options{}, err
 			}
-			out.params = map[string]interface{}{"message": value}
+			out.params = map[string]any{"message": value}
 			i++
 			continue
-		}
-		if token == "--params-json" {
+		case "--params-json":
 			value, err := requireValue(args, i, "--params-json")
 			if err != nil {
 				return options{}, err
@@ -227,8 +234,7 @@ func parseFlags() (options, error) {
 			paramsJSON = value
 			i++
 			continue
-		}
-		if token == "--expect-error" {
+		case "--expect-error":
 			value, err := requireValue(args, i, "--expect-error")
 			if err != nil {
 				return options{}, err
@@ -236,8 +242,7 @@ func parseFlags() (options, error) {
 			expectError = value
 			i++
 			continue
-		}
-		if token == "--timeout-ms" {
+		case "--timeout-ms":
 			value, err := requireValue(args, i, "--timeout-ms")
 			if err != nil {
 				return options{}, err
@@ -250,6 +255,7 @@ func parseFlags() (options, error) {
 			i++
 			continue
 		}
+
 		if strings.HasPrefix(token, "--") {
 			return options{}, fmt.Errorf("unknown flag: %s", token)
 		}
@@ -264,7 +270,7 @@ func parseFlags() (options, error) {
 	}
 
 	if out.params == nil {
-		out.params = map[string]interface{}{}
+		out.params = map[string]any{}
 	}
 
 	params, err := parseParams(paramsJSON, out.method, fmt.Sprint(out.params["message"]))
@@ -282,18 +288,18 @@ func parseFlags() (options, error) {
 	return out, nil
 }
 
-func parseParams(raw string, method string, message string) (map[string]interface{}, error) {
+func parseParams(raw, method, message string) (map[string]any, error) {
 	if strings.TrimSpace(raw) == "" {
 		if method == defaultMethod {
 			if message == "" || message == "<nil>" {
 				message = defaultMessage
 			}
-			return map[string]interface{}{"message": message}, nil
+			return map[string]any{"message": message}, nil
 		}
-		return map[string]interface{}{}, nil
+		return map[string]any{}, nil
 	}
 
-	var parsed map[string]interface{}
+	var parsed map[string]any
 	if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
 		return nil, fmt.Errorf("--params-json must be valid JSON object: %w", err)
 	}
@@ -318,40 +324,43 @@ func parseExpectedCodes(raw string) ([]int, error) {
 		}
 		code, err := strconv.Atoi(token)
 		if err != nil {
-			return nil, fmt.Errorf("invalid error code in --expect-error: %s", token)
+			return nil, fmt.Errorf("invalid --expect-error code: %s", token)
 		}
 		codes = append(codes, code)
 	}
-
 	if len(codes) == 0 {
 		return nil, fmt.Errorf("--expect-error requires at least one numeric code")
 	}
 	return codes, nil
 }
 
-func containsInt(values []int, target int) bool {
-	for _, value := range values {
-		if value == target {
+func requireValue(args []string, index int, flagName string) (string, error) {
+	if index+1 >= len(args) {
+		return "", fmt.Errorf("missing value for %s", flagName)
+	}
+	return args[index+1], nil
+}
+
+func containsInt(list []int, value int) bool {
+	for _, item := range list {
+		if item == value {
 			return true
 		}
 	}
 	return false
 }
 
-func mustWriteJSON(value interface{}) {
-	if err := json.NewEncoder(os.Stdout).Encode(value); err != nil {
-		fmt.Fprintf(os.Stderr, "encode output failed: %v\n", err)
-		os.Exit(1)
+func rpcErrorCode(err error) (int, bool) {
+	var responseErr *holonrpc.ResponseError
+	if errors.As(err, &responseErr) {
+		return responseErr.Code, true
 	}
+	return 0, false
 }
 
-func requireValue(args []string, index int, flagName string) (string, error) {
-	if index+1 >= len(args) {
-		return "", fmt.Errorf("missing value for %s", flagName)
+func mustWriteJSON(payload map[string]any) {
+	if err := json.NewEncoder(os.Stdout).Encode(payload); err != nil {
+		fmt.Fprintf(os.Stderr, "encode failed: %v\n", err)
+		os.Exit(1)
 	}
-	value := strings.TrimSpace(args[index+1])
-	if value == "" {
-		return "", fmt.Errorf("missing value for %s", flagName)
-	}
-	return value, nil
 }

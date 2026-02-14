@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SDK_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+GO_HOLONS_DIR="${SDK_DIR}/../go-holons"
+SLOW_HELPER_PATH="${SDK_DIR}/test/go_echo_server_slow.go"
+PREFERRED_GO_BIN="/Users/bpds/go/go1.25.1/bin/go"
+
+resolve_go_bin() {
+  if [[ -n "${GO_BIN:-}" ]]; then
+    printf '%s\n' "${GO_BIN}"
+    return
+  fi
+  if [[ -x "${PREFERRED_GO_BIN}" ]]; then
+    printf '%s\n' "${PREFERRED_GO_BIN}"
+    return
+  fi
+  printf '%s\n' "go"
+}
+
+GO_CMD="$(resolve_go_bin)"
+export GOCACHE="${GOCACHE:-/tmp/go-cache}"
+
+cd "${GO_HOLONS_DIR}"
+
+contains_flag() {
+  local flag_name="$1"
+  shift
+  local arg
+  for arg in "$@"; do
+    if [[ "${arg}" == "${flag_name}" || "${arg}" == "${flag_name}="* ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+select_target_pid() {
+  local child_pid=""
+  local attempt
+  for attempt in $(seq 1 20); do
+    child_pid="$(pgrep -P "${GO_PID}" | tail -n1 || true)"
+    if [[ -n "${child_pid}" ]]; then
+      printf '%s\n' "${child_pid}"
+      return
+    fi
+    sleep 0.02
+  done
+  printf '%s\n' "${GO_PID}"
+}
+
+forward_signal() {
+  local signal_name="$1"
+  if [[ "${GO_PID:-0}" -le 0 ]]; then
+    return
+  fi
+  if ! kill -0 "${GO_PID}" 2>/dev/null; then
+    return
+  fi
+
+  local target_pid
+  target_pid="$(select_target_pid)"
+  kill -"${signal_name}" "${target_pid}" 2>/dev/null || true
+}
+
+if [[ "$#" -gt 0 && "$1" == "serve" ]]; then
+  if contains_flag "--handler-delay-ms" "${@:2}"; then
+    exec "${GO_CMD}" run "${SLOW_HELPER_PATH}" serve --sdk c-holons "${@:2}"
+  fi
+  exec "${GO_CMD}" run ./cmd/echo-server serve --sdk c-holons "${@:2}"
+fi
+
+if contains_flag "--handler-delay-ms" "$@"; then
+  "${GO_CMD}" run "${SLOW_HELPER_PATH}" --sdk c-holons "$@" &
+else
+  "${GO_CMD}" run ./cmd/echo-server --sdk c-holons "$@" &
+fi
+
+GO_PID=$!
+RECEIVED_SIGNAL=""
+
+trap 'RECEIVED_SIGNAL="TERM"; forward_signal TERM' TERM
+trap 'RECEIVED_SIGNAL="INT"; forward_signal INT' INT
+
+while true; do
+  set +e
+  wait "${GO_PID}"
+  exit_code=$?
+  set -e
+
+  if [[ -n "${RECEIVED_SIGNAL}" && "${exit_code}" -ge 128 ]] && kill -0 "${GO_PID}" 2>/dev/null; then
+    continue
+  fi
+  break
+done
+
+trap - TERM
+trap - INT
+exit "${exit_code}"

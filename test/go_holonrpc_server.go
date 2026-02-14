@@ -2,125 +2,155 @@ package main
 
 import (
 	"context"
-	"encoding/json"
+	"flag"
 	"fmt"
-	"net"
-	"net/http"
 	"os"
+	"os/signal"
+	"strings"
 	"sync"
+	"syscall"
 	"time"
 
-	"nhooyr.io/websocket"
+	"github.com/Organic-Programming/go-holons/pkg/holonrpc"
 )
 
-type rpcError struct {
-	Code    int         `json:"code"`
-	Message string      `json:"message"`
-	Data    interface{} `json:"data,omitempty"`
-}
+const (
+	defaultBindURL = "ws://127.0.0.1:0/rpc"
+	defaultSDK     = "c-holons"
+	defaultVersion = "0.1.0"
+)
 
-type rpcMessage struct {
-	JSONRPC string                 `json:"jsonrpc,omitempty"`
-	ID      interface{}            `json:"id,omitempty"`
-	Method  string                 `json:"method,omitempty"`
-	Params  map[string]interface{} `json:"params,omitempty"`
-	Result  map[string]interface{} `json:"result,omitempty"`
-	Error   *rpcError              `json:"error,omitempty"`
+type options struct {
+	bindURL string
+	sdk     string
+	version string
+	once    bool
 }
 
 func main() {
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	opts, err := parseFlags()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "listen failed: %v\n", err)
-		os.Exit(1)
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
 	}
-	defer listener.Close()
+
+	server := holonrpc.NewServer(opts.bindURL)
 
 	handled := make(chan struct{})
-	var once sync.Once
+	var handledOnce sync.Once
 	markHandled := func() {
-		once.Do(func() {
+		handledOnce.Do(func() {
 			close(handled)
 		})
 	}
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/rpc", func(w http.ResponseWriter, r *http.Request) {
-		conn, acceptErr := websocket.Accept(w, r, &websocket.AcceptOptions{Subprotocols: []string{"holon-rpc"}})
-		if acceptErr != nil {
-			markHandled()
-			return
+	var latestClientMu sync.RWMutex
+	latestClientID := ""
+
+	server.Register("echo.v1.Echo/Ping", func(_ context.Context, params map[string]any) (map[string]any, error) {
+		markHandled()
+		out := make(map[string]any, len(params)+2)
+		for k, v := range params {
+			out[k] = v
 		}
-		defer markHandled()
-		defer conn.Close(websocket.StatusNormalClosure, "done")
-
-		ctx := r.Context()
-		for {
-			_, data, readErr := conn.Read(ctx)
-			if readErr != nil {
-				return
-			}
-
-			var msg rpcMessage
-			if err := json.Unmarshal(data, &msg); err != nil {
-				_ = writeError(ctx, conn, nil, -32700, "parse error")
-				continue
-			}
-			if msg.JSONRPC != "2.0" {
-				_ = writeError(ctx, conn, msg.ID, -32600, "invalid request")
-				continue
-			}
-
-			switch msg.Method {
-			case "rpc.heartbeat":
-				_ = writeResult(ctx, conn, msg.ID, map[string]interface{}{})
-			case "echo.v1.Echo/Ping":
-				params := msg.Params
-				if params == nil {
-					params = map[string]interface{}{}
-				}
-				_ = writeResult(ctx, conn, msg.ID, map[string]interface{}{
-					"message": params["message"],
-					"sdk":     "go-holons",
-					"version": "0.3.0",
-				})
-			default:
-				_ = writeError(ctx, conn, msg.ID, -32601, fmt.Sprintf("method %q not found", msg.Method))
-			}
-		}
+		out["sdk"] = opts.sdk
+		out["version"] = opts.version
+		return out, nil
 	})
 
-	server := &http.Server{Handler: mux}
+	server.Register("echo.v1.Echo/CallClient", func(ctx context.Context, params map[string]any) (map[string]any, error) {
+		markHandled()
+		latestClientMu.RLock()
+		clientID := latestClientID
+		latestClientMu.RUnlock()
+		if clientID == "" {
+			return nil, &holonrpc.ResponseError{
+				Code:    14,
+				Message: "no connected client",
+			}
+		}
+
+		name := "c"
+		if rawName, ok := params["name"].(string); ok {
+			trimmed := strings.TrimSpace(rawName)
+			if trimmed != "" {
+				name = trimmed
+			}
+		}
+
+		return server.Invoke(ctx, clientID, "client.v1.Client/Hello", map[string]any{"name": name})
+	})
+
+	addr, err := server.Start()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "start failed: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println(addr)
+
+	if opts.once {
+		select {
+		case <-handled:
+		case <-time.After(10 * time.Second):
+		}
+
+		closeCtx, closeCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer closeCancel()
+		if err := server.Close(closeCtx); err != nil {
+			fmt.Fprintf(os.Stderr, "close failed: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	waitCtx, waitCancel := context.WithCancel(context.Background())
+	defer waitCancel()
+
 	go func() {
-		if serveErr := server.Serve(listener); serveErr != nil && serveErr != http.ErrServerClosed {
-			fmt.Fprintf(os.Stderr, "serve failed: %v\n", serveErr)
+		for {
+			id, waitErr := server.WaitForClient(waitCtx)
+			if waitErr != nil {
+				return
+			}
+			latestClientMu.Lock()
+			latestClientID = id
+			latestClientMu.Unlock()
 		}
 	}()
 
-	fmt.Printf("ws://%s/rpc\n", listener.Addr().String())
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+	<-sigCh
+	signal.Stop(sigCh)
+	waitCancel()
 
-	select {
-	case <-handled:
-	case <-time.After(10 * time.Second):
+	closeCtx, closeCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer closeCancel()
+	if err := server.Close(closeCtx); err != nil {
+		fmt.Fprintf(os.Stderr, "close failed: %v\n", err)
+		os.Exit(1)
 	}
-
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	_ = server.Shutdown(shutdownCtx)
 }
 
-func writeResult(ctx context.Context, conn *websocket.Conn, id interface{}, result map[string]interface{}) error {
-	payload, err := json.Marshal(rpcMessage{JSONRPC: "2.0", ID: id, Result: result})
-	if err != nil {
-		return err
-	}
-	return conn.Write(ctx, websocket.MessageText, payload)
-}
+func parseFlags() (options, error) {
+	sdk := flag.String("sdk", defaultSDK, "sdk name returned in echo responses")
+	version := flag.String("version", defaultVersion, "sdk version returned in echo responses")
+	once := flag.Bool("once", false, "exit after handling first client request")
+	flag.Parse()
 
-func writeError(ctx context.Context, conn *websocket.Conn, id interface{}, code int, message string) error {
-	payload, err := json.Marshal(rpcMessage{JSONRPC: "2.0", ID: id, Error: &rpcError{Code: code, Message: message}})
-	if err != nil {
-		return err
+	if flag.NArg() > 1 {
+		return options{}, fmt.Errorf("usage: go_holonrpc_server.go [ws://host:port/rpc] [--sdk <name>] [--version <version>]")
 	}
-	return conn.Write(ctx, websocket.MessageText, payload)
+
+	bindURL := defaultBindURL
+	if flag.NArg() == 1 {
+		bindURL = flag.Arg(0)
+	}
+
+	return options{
+		bindURL: bindURL,
+		sdk:     *sdk,
+		version: *version,
+		once:    *once,
+	}, nil
 }

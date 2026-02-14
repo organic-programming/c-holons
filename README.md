@@ -38,6 +38,7 @@ clang -std=c11 -Wall -Wextra -pedantic -I include src/holons.c test/holons_test.
 - `./bin/echo-server`
 - `./bin/echo-client`
 - `./bin/holon-rpc-client`
+- `./bin/holon-rpc-server`
 
 These wrappers invoke Go reference helpers with default SDK metadata set
 to `c-holons` and support argument pass-through.
