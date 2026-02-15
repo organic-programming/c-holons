@@ -21,6 +21,10 @@ const (
 	defaultListenURI = "tcp://127.0.0.1:0"
 	defaultSDK       = "c-holons"
 	defaultVersion   = "0.1.0"
+
+	minMessageBytes     = 1 * 1024 * 1024
+	defaultMaxRecvBytes = 1536 * 1024
+	defaultMaxSendBytes = 1536 * 1024
 )
 
 type options struct {
@@ -28,6 +32,8 @@ type options struct {
 	sdk          string
 	version      string
 	handlerDelay time.Duration
+	maxRecvBytes int
+	maxSendBytes int
 }
 
 type PingRequest struct {
@@ -128,7 +134,11 @@ func main() {
 	}
 	defer lis.Close()
 
-	grpcServer := grpc.NewServer(grpc.ForceServerCodec(jsonCodec{}))
+	grpcServer := grpc.NewServer(
+		grpc.ForceServerCodec(jsonCodec{}),
+		grpc.MaxRecvMsgSize(opts.maxRecvBytes),
+		grpc.MaxSendMsgSize(opts.maxSendBytes),
+	)
 	grpcServer.RegisterService(&echoServiceDesc, server{
 		sdk:          opts.sdk,
 		version:      opts.version,
@@ -179,6 +189,8 @@ func parseFlags() options {
 	sdk := flag.String("sdk", defaultSDK, "sdk identifier in Ping response")
 	version := flag.String("version", defaultVersion, "sdk version in Ping response")
 	handlerDelay := flag.Int("handler-delay-ms", 0, "artificial delay in Ping handler (ms)")
+	maxRecvBytes := flag.Int("max-recv-bytes", defaultMaxRecvBytes, "maximum inbound gRPC message size in bytes")
+	maxSendBytes := flag.Int("max-send-bytes", defaultMaxSendBytes, "maximum outbound gRPC message size in bytes")
 	flag.Parse()
 
 	listenURI := *listen
@@ -191,11 +203,22 @@ func parseFlags() options {
 		delay = 0
 	}
 
+	recvLimit := *maxRecvBytes
+	if recvLimit < minMessageBytes {
+		recvLimit = minMessageBytes
+	}
+	sendLimit := *maxSendBytes
+	if sendLimit < minMessageBytes {
+		sendLimit = minMessageBytes
+	}
+
 	return options{
 		listenURI:    listenURI,
 		sdk:          *sdk,
 		version:      *version,
 		handlerDelay: delay,
+		maxRecvBytes: recvLimit,
+		maxSendBytes: sendLimit,
 	}
 }
 

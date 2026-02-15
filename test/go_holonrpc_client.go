@@ -19,6 +19,9 @@ const (
 	defaultMethod    = "echo.v1.Echo/Ping"
 	defaultMessage   = "cert"
 	defaultTimeoutMS = 5000
+
+	connectOnlyHeartbeatInterval = 200 * time.Millisecond
+	connectOnlyHeartbeatTimeout  = 400 * time.Millisecond
 )
 
 type options struct {
@@ -61,6 +64,11 @@ func main() {
 		})
 	}
 
+	if args.connectOnly {
+		runConnectOnly(client, args, startedAt, timeout)
+		return
+	}
+
 	connectCtx, connectCancel := context.WithTimeout(context.Background(), timeout)
 	err = client.Connect(connectCtx, args.url)
 	connectCancel()
@@ -71,17 +79,6 @@ func main() {
 	defer func() {
 		_ = client.Close()
 	}()
-
-	if args.connectOnly {
-		mustWriteJSON(map[string]any{
-			"status":     "pass",
-			"sdk":        args.sdk,
-			"server_sdk": args.serverSDK,
-			"latency_ms": time.Since(startedAt).Milliseconds(),
-			"check":      "connect",
-		})
-		return
-	}
 
 	if args.bidirectional {
 		runBidirectional(client, args, startedAt, timeout)
@@ -127,6 +124,104 @@ func main() {
 		"server_sdk": args.serverSDK,
 		"latency_ms": time.Since(startedAt).Milliseconds(),
 		"method":     args.method,
+	})
+}
+
+func runConnectOnly(client *holonrpc.Client, args options, startedAt time.Time, timeout time.Duration) {
+	probeCtx, probeCancel := context.WithTimeout(context.Background(), timeout)
+	defer probeCancel()
+
+	if err := client.ConnectWithReconnect(probeCtx, args.url); err != nil {
+		fmt.Fprintf(os.Stderr, "dial failed: %v\n", err)
+		os.Exit(1)
+	}
+	defer func() {
+		_ = client.Close()
+	}()
+
+	deadline, hasDeadline := probeCtx.Deadline()
+	if !hasDeadline {
+		deadline = time.Now().Add(timeout)
+	}
+
+	connected := client.Connected()
+	connectedAtLeastOnce := connected
+	sawDisconnect := false
+	sawReconnect := false
+
+	for time.Now().Before(deadline) {
+		invokeTimeout := connectOnlyHeartbeatTimeout
+		if remaining := time.Until(deadline); remaining < invokeTimeout {
+			invokeTimeout = remaining
+		}
+		if invokeTimeout <= 0 {
+			break
+		}
+
+		invokeCtx, invokeCancel := context.WithTimeout(probeCtx, invokeTimeout)
+		_, err := client.Invoke(invokeCtx, "rpc.heartbeat", map[string]any{})
+		invokeCancel()
+		if err != nil {
+			if code, ok := rpcErrorCode(err); ok && code == 14 {
+				sawDisconnect = true
+			}
+		} else {
+			connectedAtLeastOnce = true
+		}
+
+		connectedNow := client.Connected()
+		if connected && !connectedNow {
+			sawDisconnect = true
+		}
+		if !connected && connectedNow {
+			connectedAtLeastOnce = true
+			if sawDisconnect {
+				sawReconnect = true
+			}
+		}
+		if sawDisconnect && connectedNow {
+			sawReconnect = true
+		}
+		connected = connectedNow
+
+		sleepFor := connectOnlyHeartbeatInterval
+		if remaining := time.Until(deadline); remaining < sleepFor {
+			sleepFor = remaining
+		}
+		if sleepFor <= 0 {
+			break
+		}
+
+		timer := time.NewTimer(sleepFor)
+		select {
+		case <-probeCtx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+		case <-timer.C:
+		}
+		if probeCtx.Err() != nil {
+			break
+		}
+	}
+
+	if !connectedAtLeastOnce {
+		fmt.Fprintln(os.Stderr, "connect-only probe did not establish a healthy connection")
+		os.Exit(1)
+	}
+
+	mustWriteJSON(map[string]any{
+		"status":           "pass",
+		"sdk":              args.sdk,
+		"server_sdk":       args.serverSDK,
+		"latency_ms":       time.Since(startedAt).Milliseconds(),
+		"check":            "connect",
+		"saw_disconnect":   sawDisconnect,
+		"recovered":        !sawDisconnect || sawReconnect,
+		"reconnect_active": true,
 	})
 }
 

@@ -19,14 +19,16 @@
     "grpc_dial_ws": true,
     "holon_rpc_client": true,
     "holon_rpc_server": true,
+    "holon_rpc_reconnect": true,
+    "grpc_reject_oversize": true,
     "bidirectional": true,
     "valence": "multi",
     "routing": ["unicast", "fanout"]
   },
   "last_certified": {
-    "commit": "",
-    "date": "",
-    "level": 0
+    "commit": "01c48364b8da70d594d11ae9cd8095e2002036a3",
+    "date": "2026-02-15",
+    "level": 5
   },
   "role": "client"
 }

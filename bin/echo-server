@@ -6,6 +6,8 @@ SDK_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 GO_HOLONS_DIR="${SDK_DIR}/../go-holons"
 SLOW_HELPER_PATH="${SDK_DIR}/test/go_echo_server_slow.go"
 PREFERRED_GO_BIN="/Users/bpds/go/go1.25.1/bin/go"
+DEFAULT_MAX_RECV_BYTES="1572864"
+DEFAULT_MAX_SEND_BYTES="1572864"
 
 resolve_go_bin() {
   if [[ -n "${GO_BIN:-}" ]]; then
@@ -65,17 +67,26 @@ forward_signal() {
 }
 
 if [[ "$#" -gt 0 && "$1" == "serve" ]]; then
-  if contains_flag "--handler-delay-ms" "${@:2}"; then
-    exec "${GO_CMD}" run "${SLOW_HELPER_PATH}" serve --sdk c-holons "${@:2}"
+  serve_args=("${@:2}")
+  server_flags=(--sdk c-holons)
+  if ! contains_flag "--max-recv-bytes" "${serve_args[@]}"; then
+    server_flags+=(--max-recv-bytes "${DEFAULT_MAX_RECV_BYTES}")
   fi
-  exec "${GO_CMD}" run ./cmd/echo-server serve --sdk c-holons "${@:2}"
+  if ! contains_flag "--max-send-bytes" "${serve_args[@]}"; then
+    server_flags+=(--max-send-bytes "${DEFAULT_MAX_SEND_BYTES}")
+  fi
+  exec "${GO_CMD}" run "${SLOW_HELPER_PATH}" serve "${server_flags[@]}" "${serve_args[@]}"
 fi
 
-if contains_flag "--handler-delay-ms" "$@"; then
-  "${GO_CMD}" run "${SLOW_HELPER_PATH}" --sdk c-holons "$@" &
-else
-  "${GO_CMD}" run ./cmd/echo-server --sdk c-holons "$@" &
+run_args=("$@")
+server_flags=(--sdk c-holons)
+if ! contains_flag "--max-recv-bytes" "${run_args[@]}"; then
+  server_flags+=(--max-recv-bytes "${DEFAULT_MAX_RECV_BYTES}")
 fi
+if ! contains_flag "--max-send-bytes" "${run_args[@]}"; then
+  server_flags+=(--max-send-bytes "${DEFAULT_MAX_SEND_BYTES}")
+fi
+"${GO_CMD}" run "${SLOW_HELPER_PATH}" "${server_flags[@]}" "${run_args[@]}" &
 
 GO_PID=$!
 RECEIVED_SIGNAL=""

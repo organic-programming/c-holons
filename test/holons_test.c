@@ -85,6 +85,45 @@ static int command_exit_code(const char *cmd) {
   return WEXITSTATUS(status);
 }
 
+static int run_bash_script(const char *script_body) {
+  char path[] = "/tmp/holons_script_XXXXXX";
+  char cmd[512];
+  int fd = mkstemp(path);
+  FILE *script_file;
+  int exit_code;
+
+  if (fd < 0) {
+    return -1;
+  }
+
+  script_file = fdopen(fd, "w");
+  if (script_file == NULL) {
+    close(fd);
+    unlink(path);
+    return -1;
+  }
+
+  fputs("#!/usr/bin/env bash\n", script_file);
+  fputs("set -euo pipefail\n", script_file);
+  fputs(script_body, script_file);
+  if (ferror(script_file)) {
+    (void)fclose(script_file);
+    unlink(path);
+    return -1;
+  }
+  (void)fclose(script_file);
+
+  if (chmod(path, 0700) != 0) {
+    unlink(path);
+    return -1;
+  }
+
+  snprintf(cmd, sizeof(cmd), "%s", path);
+  exit_code = command_exit_code(cmd);
+  unlink(path);
+  return exit_code;
+}
+
 static void restore_env(const char *name, char *value) {
   if (value != NULL) {
     (void)setenv(name, value, 1);
@@ -116,6 +155,10 @@ static void test_certification_declarations(void) {
   check_int(strstr(raw, "\"grpc_dial_ws\": true") != NULL, "cert grpc_dial_ws declaration");
   check_int(strstr(raw, "\"holon_rpc_client\": true") != NULL, "cert holon_rpc_client capability");
   check_int(strstr(raw, "\"holon_rpc_server\": true") != NULL, "cert holon_rpc_server capability");
+  check_int(strstr(raw, "\"holon_rpc_reconnect\": true") != NULL,
+            "cert holon_rpc_reconnect capability");
+  check_int(strstr(raw, "\"grpc_reject_oversize\": true") != NULL,
+            "cert grpc_reject_oversize capability");
   check_int(strstr(raw, "\"bidirectional\": true") != NULL, "cert bidirectional capability");
   check_int(strstr(raw, "\"valence\": \"multi\"") != NULL, "cert valence declaration");
   check_int(strstr(raw, "\"routing\": [\"unicast\", \"fanout\"]") != NULL, "cert routing declaration");
@@ -236,9 +279,13 @@ static void test_echo_wrapper_invocation(void) {
     check_int(strstr(capture, "PWD=") != NULL && strstr(capture, "/sdk/go-holons") != NULL,
               "echo-server wrapper cwd");
     check_int(strstr(capture, "ARG0=run") != NULL, "echo-server wrapper uses go run");
-    check_int(strstr(capture, "ARG1=./cmd/echo-server") != NULL, "echo-server wrapper command path");
+    check_int(strstr(capture, "go_echo_server_slow.go") != NULL, "echo-server wrapper helper path");
     check_int(strstr(capture, "--sdk") != NULL && strstr(capture, "c-holons") != NULL,
               "echo-server wrapper sdk default");
+    check_int(strstr(capture, "--max-recv-bytes") != NULL && strstr(capture, "1572864") != NULL,
+              "echo-server wrapper max recv default");
+    check_int(strstr(capture, "--max-send-bytes") != NULL && strstr(capture, "1572864") != NULL,
+              "echo-server wrapper max send default");
     check_int(strstr(capture, "--listen") != NULL && strstr(capture, "stdio://") != NULL,
               "echo-server wrapper forwards listen URI");
   }
@@ -250,12 +297,15 @@ static void test_echo_wrapper_invocation(void) {
   check_int(read_file(fake_log, capture, sizeof(capture)) == 0,
             "read echo-server wrapper serve capture");
   if (capture[0] != '\0') {
-    check_int(strstr(capture, "ARG1=./cmd/echo-server") != NULL,
-              "echo-server serve wrapper command path");
-    check_int(strstr(capture, "ARG2=serve") != NULL, "echo-server serve wrapper preserves serve");
-    check_int(strstr(capture, "ARG3=--sdk") != NULL &&
-                  strstr(capture, "ARG4=c-holons") != NULL,
+    check_int(strstr(capture, "go_echo_server_slow.go") != NULL,
+              "echo-server serve wrapper helper path");
+    check_int(strstr(capture, "serve") != NULL, "echo-server serve wrapper preserves serve");
+    check_int(strstr(capture, "--sdk") != NULL && strstr(capture, "c-holons") != NULL,
               "echo-server serve wrapper default sdk placement");
+    check_int(strstr(capture, "--max-recv-bytes") != NULL && strstr(capture, "1572864") != NULL,
+              "echo-server serve wrapper max recv default");
+    check_int(strstr(capture, "--max-send-bytes") != NULL && strstr(capture, "1572864") != NULL,
+              "echo-server serve wrapper max send default");
     check_int(strstr(capture, "--listen") != NULL && strstr(capture, "stdio://") != NULL,
               "echo-server serve wrapper forwards listen URI");
   }
@@ -605,7 +655,7 @@ static void test_cross_language_go_holonrpc(void) {
   const char *go_bin = resolve_go_binary();
   const char *helper = "../c-holons/test/go_holonrpc_server.go";
   const char *client_args[] = {
-      "--connect-only",
+      "--connect-only --timeout-ms 1200",
       "--method echo.v1.Echo/Ping --message cert",
       "--method does.not.Exist/Nope --expect-error -32601,12",
       "--method rpc.heartbeat",
@@ -679,6 +729,94 @@ static void test_go_client_against_sdk_stdio_server(void) {
            go_bin);
   exit_code = command_exit_code(cmd);
   check_int(exit_code == 0, "go echo-client stdio dial against c-holons server");
+}
+
+static void test_holonrpc_connect_only_reconnect_probe(void) {
+  const char *script =
+      "cleanup() {\n"
+      "  if [ -n \"${C_PID:-}\" ] && kill -0 \"$C_PID\" >/dev/null 2>&1; then\n"
+      "    kill -TERM \"$C_PID\" >/dev/null 2>&1 || true\n"
+      "    wait \"$C_PID\" >/dev/null 2>&1 || true\n"
+      "  fi\n"
+      "  if [ -n \"${S1_PID:-}\" ] && kill -0 \"$S1_PID\" >/dev/null 2>&1; then\n"
+      "    kill -TERM \"$S1_PID\" >/dev/null 2>&1 || true\n"
+      "    wait \"$S1_PID\" >/dev/null 2>&1 || true\n"
+      "  fi\n"
+      "  if [ -n \"${S2_PID:-}\" ] && kill -0 \"$S2_PID\" >/dev/null 2>&1; then\n"
+      "    kill -TERM \"$S2_PID\" >/dev/null 2>&1 || true\n"
+      "    wait \"$S2_PID\" >/dev/null 2>&1 || true\n"
+      "  fi\n"
+      "}\n"
+      "trap cleanup EXIT\n"
+      "PORT=\"\"\n"
+      "for p in $(seq 39310 39390); do\n"
+      "  if ! lsof -nP -iTCP:\"$p\" -sTCP:LISTEN >/dev/null 2>&1; then\n"
+      "    PORT=\"$p\"\n"
+      "    break\n"
+      "  fi\n"
+      "done\n"
+      "[ -n \"$PORT\" ]\n"
+      "URL=\"ws://127.0.0.1:${PORT}/rpc\"\n"
+      "S1_OUT=$(mktemp)\n"
+      "S1_ERR=$(mktemp)\n"
+      "./bin/holon-rpc-server --sdk go-holons \"$URL\" >\"$S1_OUT\" 2>\"$S1_ERR\" &\n"
+      "S1_PID=$!\n"
+      "for _ in $(seq 1 80); do\n"
+      "  if [ -s \"$S1_OUT\" ]; then break; fi\n"
+      "  sleep 0.05\n"
+      "done\n"
+      "C_OUT=$(mktemp)\n"
+      "C_ERR=$(mktemp)\n"
+      "./bin/holon-rpc-client \"$URL\" --connect-only --timeout-ms 5200 >\"$C_OUT\" 2>\"$C_ERR\" &\n"
+      "C_PID=$!\n"
+      "sleep 1\n"
+      "kill -0 \"$C_PID\" >/dev/null 2>&1\n"
+      "kill -TERM \"$S1_PID\" >/dev/null 2>&1 || true\n"
+      "wait \"$S1_PID\" >/dev/null 2>&1 || true\n"
+      "S2_OUT=$(mktemp)\n"
+      "S2_ERR=$(mktemp)\n"
+      "./bin/holon-rpc-server --sdk go-holons \"$URL\" >\"$S2_OUT\" 2>\"$S2_ERR\" &\n"
+      "S2_PID=$!\n"
+      "sleep 0.3\n"
+      "sleep 1\n"
+      "kill -0 \"$C_PID\" >/dev/null 2>&1\n"
+      "wait \"$C_PID\"\n"
+      "grep -q '\"status\":\"pass\"' \"$C_OUT\"\n";
+
+  check_int(run_bash_script(script) == 0, "holon-rpc connect-only reconnect probe");
+}
+
+static void test_echo_server_rejects_oversized_message(void) {
+  const char *go_bin = resolve_go_binary();
+  char script[8192];
+
+  snprintf(script,
+           sizeof(script),
+           "cleanup() {\n"
+           "  if [ -n \"${S_PID:-}\" ] && kill -0 \"$S_PID\" >/dev/null 2>&1; then\n"
+           "    kill -TERM \"$S_PID\" >/dev/null 2>&1 || true\n"
+           "    wait \"$S_PID\" >/dev/null 2>&1 || true\n"
+           "  fi\n"
+           "}\n"
+           "trap cleanup EXIT\n"
+           "S_OUT=$(mktemp)\n"
+           "S_ERR=$(mktemp)\n"
+           "./bin/echo-server --listen tcp://127.0.0.1:0 >\"$S_OUT\" 2>\"$S_ERR\" &\n"
+           "S_PID=$!\n"
+           "ADDR=\"\"\n"
+           "for _ in $(seq 1 120); do\n"
+           "  if [ -s \"$S_OUT\" ]; then\n"
+           "    ADDR=$(head -n1 \"$S_OUT\" | tr -d '\\\\r\\\\n')\n"
+           "    if [ -n \"$ADDR\" ]; then break; fi\n"
+           "  fi\n"
+           "  sleep 0.05\n"
+           "done\n"
+           "[ -n \"$ADDR\" ]\n"
+           "cd ../go-holons\n"
+           "'%s' run ../c-holons/test/go_large_ping.go \"$ADDR\" >/dev/null 2>&1\n",
+           go_bin);
+
+  check_int(run_bash_script(script) == 0, "echo-server oversized request rejection");
 }
 
 static void test_ws_transport(void) {
@@ -790,6 +928,8 @@ int main(void) {
   test_serve_stdio();
   test_cross_language_go_echo();
   test_cross_language_go_holonrpc();
+  test_holonrpc_connect_only_reconnect_probe();
+  test_echo_server_rejects_oversized_message();
   test_go_client_against_sdk_stdio_server();
 
   printf("%d passed, %d failed\n", passed, failed);
