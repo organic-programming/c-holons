@@ -12,7 +12,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/Organic-Programming/go-holons/pkg/holonrpc"
+	"github.com/organic-programming/go-holons/pkg/holonrpc"
 )
 
 const (
