@@ -16,7 +16,7 @@ C SDK for Organic Programming.
 The package mirrors the Go reference surface:
 - `transport`: URI parsing + listeners for `tcp`, `unix`, `stdio`, `mem`, `ws`, `wss`
 - `serve`: standard `--listen` / `--port` handling with signal-aware accept loop
-- `identity`: `HOLON.md` frontmatter parsing
+- `identity`: `holon.yaml` parsing
 
 ## Build and test
 
@@ -54,7 +54,7 @@ to `c-holons` and support argument pass-through.
 | `holons_dial_tcp` | Client-side dial for TCP listeners |
 | `holons_dial_stdio` | Wrap current process stdin/stdout as a client connection |
 | `holons_serve` | Standard connection loop for a holon `serve` command |
-| `holons_parse_holon` | Parse identity fields from `HOLON.md` frontmatter |
+| `holons_parse_holon` | Parse identity fields from `holon.yaml` |
 
 ## Transport notes
 
