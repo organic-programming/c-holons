@@ -6,12 +6,15 @@
 
 #include <arpa/inet.h>
 #include <ctype.h>
+#include <dirent.h>
 #include <errno.h>
+#include <limits.h>
 #include <netdb.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -107,6 +110,410 @@ static int parse_port(const char *text, int *out_port, char *err, size_t err_len
   }
 
   *out_port = (int)value;
+  return 0;
+}
+
+static int path_depth(const char *rel) {
+  char tmp[HOLONS_MAX_URI_LEN];
+  char *token;
+  int depth = 0;
+
+  if (rel == NULL || rel[0] == '\0' || strcmp(rel, ".") == 0) {
+    return 0;
+  }
+
+  if (copy_string(tmp, sizeof(tmp), rel, NULL, 0) != 0) {
+    return 0;
+  }
+
+  token = strtok(tmp, "/");
+  while (token != NULL) {
+    ++depth;
+    token = strtok(NULL, "/");
+  }
+  return depth;
+}
+
+static int relative_path_from_root(const char *root,
+                                   const char *dir,
+                                   char *out,
+                                   size_t out_len,
+                                   char *err,
+                                   size_t err_len) {
+  size_t root_len;
+
+  if (root == NULL || dir == NULL) {
+    return copy_string(out, out_len, ".", err, err_len);
+  }
+
+  root_len = strlen(root);
+  if (strncmp(root, dir, root_len) == 0 &&
+      (dir[root_len] == '\0' || dir[root_len] == '/' || root[root_len - 1] == '/')) {
+    const char *rel = dir + root_len;
+    while (*rel == '/') {
+      ++rel;
+    }
+    if (*rel == '\0') {
+      return copy_string(out, out_len, ".", err, err_len);
+    }
+    return copy_string(out, out_len, rel, err, err_len);
+  }
+
+  return copy_string(out, out_len, dir, err, err_len);
+}
+
+static void slug_for_identity(const holons_identity_t *id, char *out, size_t out_len) {
+  char slug[HOLONS_MAX_FIELD_LEN];
+  size_t i;
+  size_t n = 0;
+  const char *given = id != NULL ? id->given_name : "";
+  const char *family = id != NULL ? id->family_name : "";
+
+  if (given == NULL) {
+    given = "";
+  }
+  if (family == NULL) {
+    family = "";
+  }
+
+  while (*given != '\0' && isspace((unsigned char)*given)) {
+    ++given;
+  }
+  while (*family != '\0' && isspace((unsigned char)*family)) {
+    ++family;
+  }
+
+  if (*given == '\0' && *family == '\0') {
+    if (out != NULL && out_len > 0) {
+      out[0] = '\0';
+    }
+    return;
+  }
+
+  for (i = 0; given[i] != '\0' && n + 1 < sizeof(slug); ++i) {
+    char c = given[i];
+    if (c == ' ') {
+      c = '-';
+    }
+    slug[n++] = (char)tolower((unsigned char)c);
+  }
+  if (n > 0 && n + 1 < sizeof(slug)) {
+    slug[n++] = '-';
+  }
+  for (i = 0; family[i] != '\0' && n + 1 < sizeof(slug); ++i) {
+    char c = family[i];
+    if (c == '?') {
+      continue;
+    }
+    if (c == ' ') {
+      c = '-';
+    }
+    slug[n++] = (char)tolower((unsigned char)c);
+  }
+  while (n > 0 && slug[n - 1] == '-') {
+    --n;
+  }
+  slug[n] = '\0';
+  (void)copy_string(out, out_len, slug, NULL, 0);
+}
+
+static int parse_manifest_file(const char *path, holons_manifest_t *out, char *err, size_t err_len) {
+  FILE *f;
+  char line[1024];
+  int saw_mapping = 0;
+  char section[32] = "";
+
+  if (path == NULL || out == NULL) {
+    set_err(err, err_len, "path and output are required");
+    return -1;
+  }
+
+  (void)memset(out, 0, sizeof(*out));
+  f = fopen(path, "r");
+  if (f == NULL) {
+    set_err(err, err_len, "cannot open %s: %s", path, strerror(errno));
+    return -1;
+  }
+
+  while (fgets(line, sizeof(line), f) != NULL) {
+    char *raw = ltrim(line);
+    char *sep;
+    char *value;
+    size_t indent = (size_t)(raw - line);
+
+    rtrim(raw);
+    if (raw[0] == '\0' || raw[0] == '#') {
+      continue;
+    }
+
+    sep = strchr(raw, ':');
+    if (sep == NULL) {
+      continue;
+    }
+    saw_mapping = 1;
+    *sep = '\0';
+    value = trim(sep + 1);
+    value = strip_quotes(value);
+
+    if (indent == 0) {
+      section[0] = '\0';
+      if (strcmp(raw, "kind") == 0) {
+        (void)copy_string(out->kind, sizeof(out->kind), value, NULL, 0);
+      } else if ((strcmp(raw, "build") == 0 || strcmp(raw, "artifacts") == 0) && value[0] == '\0') {
+        (void)copy_string(section, sizeof(section), raw, NULL, 0);
+      }
+      continue;
+    }
+
+    if (strcmp(section, "build") == 0) {
+      if (strcmp(raw, "runner") == 0) {
+        (void)copy_string(out->build.runner, sizeof(out->build.runner), value, NULL, 0);
+      } else if (strcmp(raw, "main") == 0) {
+        (void)copy_string(out->build.main, sizeof(out->build.main), value, NULL, 0);
+      }
+    } else if (strcmp(section, "artifacts") == 0) {
+      if (strcmp(raw, "binary") == 0) {
+        (void)copy_string(out->artifacts.binary, sizeof(out->artifacts.binary), value, NULL, 0);
+      } else if (strcmp(raw, "primary") == 0) {
+        (void)copy_string(out->artifacts.primary, sizeof(out->artifacts.primary), value, NULL, 0);
+      }
+    }
+  }
+
+  (void)fclose(f);
+
+  if (!saw_mapping) {
+    set_err(err, err_len, "%s: holon.yaml must be a YAML mapping", path);
+    return -1;
+  }
+  return 0;
+}
+
+typedef struct {
+  holon_entry_t *items;
+  size_t count;
+  size_t capacity;
+} holon_entries_t;
+
+static int ensure_entries_capacity(holon_entries_t *entries, size_t needed, char *err, size_t err_len) {
+  holon_entry_t *next;
+  size_t new_capacity;
+
+  if (entries->capacity >= needed) {
+    return 0;
+  }
+
+  new_capacity = entries->capacity == 0 ? 8 : entries->capacity * 2;
+  while (new_capacity < needed) {
+    new_capacity *= 2;
+  }
+
+  next = realloc(entries->items, new_capacity * sizeof(*next));
+  if (next == NULL) {
+    set_err(err, err_len, "out of memory");
+    return -1;
+  }
+
+  entries->items = next;
+  entries->capacity = new_capacity;
+  return 0;
+}
+
+static int append_or_replace_entry(holon_entries_t *entries,
+                                   const holon_entry_t *entry,
+                                   char *err,
+                                   size_t err_len) {
+  size_t i;
+  const char *key = entry->uuid[0] != '\0' ? entry->uuid : entry->dir;
+
+  for (i = 0; i < entries->count; ++i) {
+    const char *existing_key =
+        entries->items[i].uuid[0] != '\0' ? entries->items[i].uuid : entries->items[i].dir;
+    if (strcmp(existing_key, key) == 0) {
+      if (path_depth(entry->relative_path) < path_depth(entries->items[i].relative_path)) {
+        entries->items[i] = *entry;
+      }
+      return 0;
+    }
+  }
+
+  if (ensure_entries_capacity(entries, entries->count + 1, err, err_len) != 0) {
+    return -1;
+  }
+  entries->items[entries->count++] = *entry;
+  return 0;
+}
+
+static int should_skip_discovery_dir(const char *root, const char *path, const char *name) {
+  (void)path;
+  if (root != NULL && path != NULL && strcmp(root, path) == 0) {
+    return 0;
+  }
+  if (strcmp(name, ".git") == 0 || strcmp(name, ".op") == 0 || strcmp(name, "node_modules") == 0 ||
+      strcmp(name, "vendor") == 0 || strcmp(name, "build") == 0) {
+    return 1;
+  }
+  return name[0] == '.';
+}
+
+static int discover_scan_dir(const char *root,
+                             const char *dir,
+                             const char *origin,
+                             holon_entries_t *entries,
+                             char *err,
+                             size_t err_len) {
+  DIR *handle;
+  struct dirent *item;
+
+  handle = opendir(dir);
+  if (handle == NULL) {
+    return 0;
+  }
+
+  while ((item = readdir(handle)) != NULL) {
+    char child[PATH_MAX];
+    struct stat st;
+
+    if (strcmp(item->d_name, ".") == 0 || strcmp(item->d_name, "..") == 0) {
+      continue;
+    }
+
+    if (snprintf(child, sizeof(child), "%s/%s", dir, item->d_name) >= (int)sizeof(child)) {
+      continue;
+    }
+
+    if (lstat(child, &st) != 0) {
+      continue;
+    }
+
+    if (S_ISDIR(st.st_mode)) {
+      if (should_skip_discovery_dir(root, child, item->d_name)) {
+        continue;
+      }
+      if (discover_scan_dir(root, child, origin, entries, err, err_len) != 0) {
+        (void)closedir(handle);
+        return -1;
+      }
+      continue;
+    }
+
+    if (!S_ISREG(st.st_mode) || strcmp(item->d_name, "holon.yaml") != 0) {
+      continue;
+    }
+
+    {
+      holon_entry_t entry;
+      char abs_dir[PATH_MAX];
+
+      (void)memset(&entry, 0, sizeof(entry));
+      if (holons_parse_holon(child, &entry.identity, NULL, 0) != 0) {
+        continue;
+      }
+      entry.has_manifest = parse_manifest_file(child, &entry.manifest, NULL, 0) == 0 ? 1 : 0;
+      if (realpath(dir, abs_dir) == NULL) {
+        (void)copy_string(abs_dir, sizeof(abs_dir), dir, NULL, 0);
+      }
+
+      slug_for_identity(&entry.identity, entry.slug, sizeof(entry.slug));
+      (void)copy_string(entry.uuid, sizeof(entry.uuid), entry.identity.uuid, NULL, 0);
+      (void)copy_string(entry.dir, sizeof(entry.dir), abs_dir, NULL, 0);
+      (void)copy_string(entry.origin, sizeof(entry.origin), origin, NULL, 0);
+      if (relative_path_from_root(root, abs_dir, entry.relative_path, sizeof(entry.relative_path), NULL, 0) != 0) {
+        (void)copy_string(entry.relative_path, sizeof(entry.relative_path), abs_dir, NULL, 0);
+      }
+
+      if (append_or_replace_entry(entries, &entry, err, err_len) != 0) {
+        (void)closedir(handle);
+        return -1;
+      }
+    }
+  }
+
+  (void)closedir(handle);
+  return 0;
+}
+
+static int compare_entries(const void *left, const void *right) {
+  const holon_entry_t *a = left;
+  const holon_entry_t *b = right;
+  int rel_cmp = strcmp(a->relative_path, b->relative_path);
+  if (rel_cmp != 0) {
+    return rel_cmp;
+  }
+  return strcmp(a->uuid, b->uuid);
+}
+
+static int resolve_root(const char *root, char *out, size_t out_len, char *err, size_t err_len) {
+  char cwd[PATH_MAX];
+  const char *candidate = root;
+
+  if (candidate == NULL || candidate[0] == '\0') {
+    if (getcwd(cwd, sizeof(cwd)) == NULL) {
+      set_err(err, err_len, "getcwd failed: %s", strerror(errno));
+      return -1;
+    }
+    candidate = cwd;
+  }
+
+  if (realpath(candidate, out) != NULL) {
+    return 0;
+  }
+  if (errno == ENOENT) {
+    out[0] = '\0';
+    return 0;
+  }
+  return copy_string(out, out_len, candidate, err, err_len);
+}
+
+static int oppath(char *out, size_t out_len, char *err, size_t err_len) {
+  const char *configured = getenv("OPPATH");
+  const char *home;
+  char buf[PATH_MAX];
+
+  if (configured != NULL && configured[0] != '\0') {
+    return resolve_root(configured, out, out_len, err, err_len);
+  }
+
+  home = getenv("HOME");
+  if (home == NULL || home[0] == '\0') {
+    return copy_string(out, out_len, ".op", err, err_len);
+  }
+
+  if (snprintf(buf, sizeof(buf), "%s/.op", home) >= (int)sizeof(buf)) {
+    set_err(err, err_len, "OPPATH is too long");
+    return -1;
+  }
+  return resolve_root(buf, out, out_len, err, err_len);
+}
+
+static int opbin(char *out, size_t out_len, char *err, size_t err_len) {
+  const char *configured = getenv("OPBIN");
+  char op_path[PATH_MAX];
+
+  if (configured != NULL && configured[0] != '\0') {
+    return resolve_root(configured, out, out_len, err, err_len);
+  }
+
+  if (oppath(op_path, sizeof(op_path), err, err_len) != 0) {
+    return -1;
+  }
+  if (snprintf(out, out_len, "%s/bin", op_path) >= (int)out_len) {
+    set_err(err, err_len, "OPBIN is too long");
+    return -1;
+  }
+  return 0;
+}
+
+static int cache_dir(char *out, size_t out_len, char *err, size_t err_len) {
+  char op_path[PATH_MAX];
+
+  if (oppath(op_path, sizeof(op_path), err, err_len) != 0) {
+    return -1;
+  }
+  if (snprintf(out, out_len, "%s/cache", op_path) >= (int)out_len) {
+    set_err(err, err_len, "cache path is too long");
+    return -1;
+  }
   return 0;
 }
 
@@ -961,6 +1368,193 @@ int holons_parse_holon(const char *path, holons_identity_t *out, char *err, size
 
   return 0;
 }
+
+int holons_discover(const char *root,
+                    holon_entry_t **entries,
+                    size_t *count,
+                    char *err,
+                    size_t err_len) {
+  char resolved_root[PATH_MAX];
+  holon_entries_t found;
+
+  if (entries == NULL || count == NULL) {
+    set_err(err, err_len, "entries and count are required");
+    return -1;
+  }
+
+  *entries = NULL;
+  *count = 0;
+  (void)memset(&found, 0, sizeof(found));
+
+  if (resolve_root(root, resolved_root, sizeof(resolved_root), err, err_len) != 0) {
+    return -1;
+  }
+  if (resolved_root[0] == '\0') {
+    return 0;
+  }
+
+  if (discover_scan_dir(resolved_root, resolved_root, "local", &found, err, err_len) != 0) {
+    free(found.items);
+    return -1;
+  }
+
+  if (found.count > 1) {
+    qsort(found.items, found.count, sizeof(*found.items), compare_entries);
+  }
+
+  *entries = found.items;
+  *count = found.count;
+  return 0;
+}
+
+int holons_discover_local(holon_entry_t **entries, size_t *count, char *err, size_t err_len) {
+  return holons_discover(NULL, entries, count, err, err_len);
+}
+
+int holons_discover_all(holon_entry_t **entries, size_t *count, char *err, size_t err_len) {
+  holon_entries_t found;
+  char roots[3][PATH_MAX];
+  const char *origins[3] = {"local", "$OPBIN", "cache"};
+  int i;
+
+  if (entries == NULL || count == NULL) {
+    set_err(err, err_len, "entries and count are required");
+    return -1;
+  }
+  *entries = NULL;
+  *count = 0;
+  (void)memset(&found, 0, sizeof(found));
+
+  if (resolve_root(NULL, roots[0], sizeof(roots[0]), err, err_len) != 0) {
+    return -1;
+  }
+  if (opbin(roots[1], sizeof(roots[1]), err, err_len) != 0) {
+    return -1;
+  }
+  if (cache_dir(roots[2], sizeof(roots[2]), err, err_len) != 0) {
+    return -1;
+  }
+
+  for (i = 0; i < 3; ++i) {
+    holon_entries_t local = {0};
+    size_t j;
+
+    if (roots[i][0] == '\0') {
+      continue;
+    }
+    if (discover_scan_dir(roots[i], roots[i], origins[i], &local, err, err_len) != 0) {
+      free(found.items);
+      free(local.items);
+      return -1;
+    }
+    for (j = 0; j < local.count; ++j) {
+      if (append_or_replace_entry(&found, &local.items[j], err, err_len) != 0) {
+        free(found.items);
+        free(local.items);
+        return -1;
+      }
+    }
+    free(local.items);
+  }
+
+  if (found.count > 1) {
+    qsort(found.items, found.count, sizeof(*found.items), compare_entries);
+  }
+
+  *entries = found.items;
+  *count = found.count;
+  return 0;
+}
+
+holon_entry_t *holons_find_by_slug(const char *slug, char *err, size_t err_len) {
+  holon_entry_t *entries = NULL;
+  holon_entry_t *match = NULL;
+  size_t count = 0;
+  size_t i;
+
+  if (slug == NULL || slug[0] == '\0') {
+    return NULL;
+  }
+
+  if (holons_discover_all(&entries, &count, err, err_len) != 0) {
+    return NULL;
+  }
+
+  for (i = 0; i < count; ++i) {
+    if (strcmp(entries[i].slug, slug) != 0) {
+      continue;
+    }
+    if (match != NULL && strcmp(match->uuid, entries[i].uuid) != 0) {
+      set_err(err, err_len, "ambiguous holon \"%s\"", slug);
+      free(entries);
+      return NULL;
+    }
+    match = &entries[i];
+  }
+
+  if (match == NULL) {
+    free(entries);
+    return NULL;
+  }
+
+  {
+    holon_entry_t *result = malloc(sizeof(*result));
+    if (result == NULL) {
+      set_err(err, err_len, "out of memory");
+      free(entries);
+      return NULL;
+    }
+    *result = *match;
+    free(entries);
+    return result;
+  }
+}
+
+holon_entry_t *holons_find_by_uuid(const char *prefix, char *err, size_t err_len) {
+  holon_entry_t *entries = NULL;
+  holon_entry_t *match = NULL;
+  size_t count = 0;
+  size_t i;
+
+  if (prefix == NULL || prefix[0] == '\0') {
+    return NULL;
+  }
+
+  if (holons_discover_all(&entries, &count, err, err_len) != 0) {
+    return NULL;
+  }
+
+  for (i = 0; i < count; ++i) {
+    if (strncmp(entries[i].uuid, prefix, strlen(prefix)) != 0) {
+      continue;
+    }
+    if (match != NULL && strcmp(match->uuid, entries[i].uuid) != 0) {
+      set_err(err, err_len, "ambiguous UUID prefix \"%s\"", prefix);
+      free(entries);
+      return NULL;
+    }
+    match = &entries[i];
+  }
+
+  if (match == NULL) {
+    free(entries);
+    return NULL;
+  }
+
+  {
+    holon_entry_t *result = malloc(sizeof(*result));
+    if (result == NULL) {
+      set_err(err, err_len, "out of memory");
+      free(entries);
+      return NULL;
+    }
+    *result = *match;
+    free(entries);
+    return result;
+  }
+}
+
+void holons_free_entries(holon_entry_t *entries) { free(entries); }
 
 volatile sig_atomic_t *holons_stop_token(void) { return &g_stop_requested; }
 

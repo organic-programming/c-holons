@@ -43,6 +43,33 @@ typedef struct {
 } holons_identity_t;
 
 typedef struct {
+  char runner[HOLONS_MAX_FIELD_LEN];
+  char main[HOLONS_MAX_FIELD_LEN];
+} holons_build_t;
+
+typedef struct {
+  char binary[HOLONS_MAX_FIELD_LEN];
+  char primary[HOLONS_MAX_FIELD_LEN];
+} holons_artifacts_t;
+
+typedef struct {
+  char kind[64];
+  holons_build_t build;
+  holons_artifacts_t artifacts;
+} holons_manifest_t;
+
+typedef struct {
+  char slug[HOLONS_MAX_FIELD_LEN];
+  char uuid[96];
+  char dir[HOLONS_MAX_URI_LEN];
+  char relative_path[HOLONS_MAX_URI_LEN];
+  char origin[32];
+  holons_identity_t identity;
+  holons_manifest_t manifest;
+  int has_manifest;
+} holon_entry_t;
+
+typedef struct {
   int read_fd;
   int write_fd;
   holons_scheme_t scheme;
@@ -93,6 +120,16 @@ int holons_serve(const char *listen_uri,
                  size_t err_len);
 
 int holons_parse_holon(const char *path, holons_identity_t *out, char *err, size_t err_len);
+int holons_discover(const char *root,
+                    holon_entry_t **entries,
+                    size_t *count,
+                    char *err,
+                    size_t err_len);
+int holons_discover_local(holon_entry_t **entries, size_t *count, char *err, size_t err_len);
+int holons_discover_all(holon_entry_t **entries, size_t *count, char *err, size_t err_len);
+holon_entry_t *holons_find_by_slug(const char *slug, char *err, size_t err_len);
+holon_entry_t *holons_find_by_uuid(const char *prefix, char *err, size_t err_len);
+void holons_free_entries(holon_entry_t *entries);
 
 volatile sig_atomic_t *holons_stop_token(void);
 void holons_request_stop(void);

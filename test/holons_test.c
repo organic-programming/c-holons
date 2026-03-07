@@ -144,6 +144,126 @@ static void test_echo_scripts_exist(void) {
   check_int(access("./bin/holon-rpc-server", X_OK) == 0, "holon-rpc-server script executable");
 }
 
+static void write_discovery_holon(const char *dir,
+                                  const char *uuid,
+                                  const char *given_name,
+                                  const char *family_name,
+                                  const char *binary) {
+  char path[1024];
+  FILE *f;
+  char cmd[1200];
+
+  snprintf(cmd, sizeof(cmd), "mkdir -p '%s'", dir);
+  (void)system(cmd);
+  snprintf(path, sizeof(path), "%s/holon.yaml", dir);
+  f = fopen(path, "w");
+  assert(f != NULL);
+  fprintf(f,
+          "schema: holon/v0\n"
+          "uuid: \"%s\"\n"
+          "given_name: \"%s\"\n"
+          "family_name: \"%s\"\n"
+          "motto: \"Test\"\n"
+          "composer: \"test\"\n"
+          "clade: deterministic/pure\n"
+          "status: draft\n"
+          "born: \"2026-03-07\"\n"
+          "generated_by: test\n"
+          "kind: native\n"
+          "build:\n"
+          "  runner: go-module\n"
+          "artifacts:\n"
+          "  binary: %s\n",
+          uuid,
+          given_name,
+          family_name,
+          binary);
+  fclose(f);
+}
+
+static void discovery_path(char *out, size_t out_len, const char *root, const char *suffix) {
+  assert(out != NULL);
+  assert(root != NULL);
+  assert(suffix != NULL);
+  assert(snprintf(out, out_len, "%s/%s", root, suffix) < (int)out_len);
+}
+
+static void test_discover(void) {
+  char root_template[] = "/tmp/holons_discover_c_XXXXXX";
+  char root[1024];
+  char alpha_dir[1024];
+  char beta_dir[1024];
+  char dup_dir[1024];
+  char hidden_dir[1024];
+  char err[256];
+  int root_fd;
+  holon_entry_t *entries = NULL;
+  size_t count = 0;
+  holon_entry_t *by_slug = NULL;
+  holon_entry_t *by_uuid = NULL;
+  char cwd[1024];
+
+  root_fd = mkstemp(root_template);
+  assert(root_fd >= 0);
+  close(root_fd);
+  assert(unlink(root_template) == 0);
+  assert(mkdir(root_template, 0700) == 0);
+  snprintf(root, sizeof(root), "%s", root_template);
+  discovery_path(alpha_dir, sizeof(alpha_dir), root, "holons/alpha");
+  discovery_path(beta_dir, sizeof(beta_dir), root, "nested/beta");
+  discovery_path(dup_dir, sizeof(dup_dir), root, "nested/dup/alpha");
+  discovery_path(hidden_dir, sizeof(hidden_dir), root, ".git/hidden");
+
+  write_discovery_holon(alpha_dir, "uuid-alpha", "Alpha", "Go", "alpha-go");
+  write_discovery_holon(beta_dir, "uuid-beta", "Beta", "Rust", "beta-rust");
+  write_discovery_holon(dup_dir, "uuid-alpha", "Alpha", "Go", "alpha-go");
+  write_discovery_holon(hidden_dir, "uuid-hidden", "Ignored", "Holon", "ignored");
+
+  err[0] = '\0';
+  check_int(holons_discover(root, &entries, &count, err, sizeof(err)) == 0, "discover returns success");
+  check_int(count == 2, "discover finds two entries");
+  if (count == 2) {
+    size_t i;
+    for (i = 0; i < count; ++i) {
+      if (strcmp(entries[i].uuid, "uuid-alpha") == 0) {
+        check_int(strcmp(entries[i].slug, "alpha-go") == 0, "discover slug");
+        check_int(strcmp(entries[i].relative_path, "holons/alpha") == 0, "discover shallowest duplicate wins");
+        check_int(entries[i].has_manifest == 1, "discover manifest present");
+        check_int(strcmp(entries[i].manifest.build.runner, "go-module") == 0, "discover manifest runner");
+      }
+    }
+  }
+  holons_free_entries(entries);
+  entries = NULL;
+
+  check_int(getcwd(cwd, sizeof(cwd)) != NULL, "capture cwd");
+  check_int(chdir(root) == 0, "chdir root for find helpers");
+  if (getenv("OPPATH") != NULL) {
+    unsetenv("OPPATH");
+  }
+  if (getenv("OPBIN") != NULL) {
+    unsetenv("OPBIN");
+  }
+
+  by_slug = holons_find_by_slug("alpha-go", err, sizeof(err));
+  check_int(by_slug != NULL, "find_by_slug finds entry");
+  if (by_slug != NULL) {
+    check_int(strcmp(by_slug->uuid, "uuid-alpha") == 0, "find_by_slug uuid");
+  }
+  holons_free_entries(by_slug);
+
+  by_uuid = holons_find_by_uuid("uuid-a", err, sizeof(err));
+  check_int(by_uuid != NULL, "find_by_uuid finds entry");
+  if (by_uuid != NULL) {
+    check_int(strcmp(by_uuid->slug, "alpha-go") == 0, "find_by_uuid slug");
+  }
+  holons_free_entries(by_uuid);
+
+  check_int(chdir(cwd) == 0, "restore cwd");
+  snprintf(err, sizeof(err), "rm -rf '%s'", root);
+  (void)system(err);
+}
+
 static void test_echo_wrapper_invocation(void) {
   char fake_go[] = "/tmp/holons_fake_go_XXXXXX";
   char fake_log[] = "/tmp/holons_fake_go_log_XXXXXX";
@@ -880,6 +1000,7 @@ static void test_serve_stdio(void) {
 int main(void) {
   test_echo_scripts_exist();
   test_echo_wrapper_invocation();
+  test_discover();
   test_scheme_and_flags();
   test_uri_parsing();
   test_identity_parsing();
