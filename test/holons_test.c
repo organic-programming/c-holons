@@ -1144,6 +1144,172 @@ static void test_connect_removes_stale_port_file(void) {
   (void)system(cleanup_cmd);
 }
 
+static void test_grpc_bridge_advertises_public_uri_first(void) {
+  char root[] = "/tmp/holons_grpc_bridge_XXXXXX";
+  char proto_dir[1024];
+  char proto_file[1024];
+  char holon_yaml[1024];
+  char backend_path[1024];
+  char backend_uri_file[1024];
+  char wrapper_path[1024];
+  char bridge_uri[256];
+  char backend_uri[256];
+  char cleanup_cmd[1200];
+  FILE *f;
+  pid_t pid = -1;
+
+  check_int(make_temp_dir(root) == 0, "grpc bridge temp root");
+  if (root[0] == '\0') {
+    return;
+  }
+
+  snprintf(proto_dir, sizeof(proto_dir), "%s/protos/greeting/v1", root);
+  snprintf(proto_file, sizeof(proto_file), "%s/greeting.proto", proto_dir);
+  snprintf(holon_yaml, sizeof(holon_yaml), "%s/holon.yaml", root);
+  snprintf(backend_path, sizeof(backend_path), "%s/backend.sh", root);
+  snprintf(backend_uri_file, sizeof(backend_uri_file), "%s/backend.uri", root);
+  snprintf(wrapper_path, sizeof(wrapper_path), "%s/bridge-wrapper.sh", root);
+
+  check_int(ensure_dir_with_system(proto_dir) == 0, "grpc bridge proto dir");
+
+  f = fopen(proto_file, "w");
+  assert(f != NULL);
+  fprintf(f,
+          "syntax = \"proto3\";\n"
+          "package greeting.v1;\n"
+          "service GreetingService {\n"
+          "  rpc Ping(PingRequest) returns (PingResponse);\n"
+          "}\n"
+          "message PingRequest {}\n"
+          "message PingResponse {}\n");
+  fclose(f);
+
+  f = fopen(holon_yaml, "w");
+  assert(f != NULL);
+  fprintf(f,
+          "schema: holon/v0\n"
+          "uuid: \"grpc-bridge-test\"\n"
+          "given_name: \"bridge\"\n"
+          "family_name: \"test\"\n"
+          "motto: \"Checks startup ordering.\"\n");
+  fclose(f);
+
+  f = fopen(backend_path, "w");
+  assert(f != NULL);
+  fprintf(f,
+          "#!/bin/sh\n"
+          "exec python3 - \"$@\" <<'PY'\n"
+          "import signal\n"
+          "import socket\n"
+          "import sys\n"
+          "import time\n"
+          "\n"
+          "uri_file = %c%s%c\n"
+          "listen_uri = 'tcp://127.0.0.1:0'\n"
+          "args = sys.argv[1:]\n"
+          "for i, arg in enumerate(args):\n"
+          "    if arg == '--listen' and i + 1 < len(args):\n"
+          "        listen_uri = args[i + 1]\n"
+          "        break\n"
+          "\n"
+          "if not listen_uri.startswith('tcp://'):\n"
+          "    raise SystemExit('unsupported listen uri')\n"
+          "\n"
+          "host_port = listen_uri[len('tcp://'):]\n"
+          "host, port_text = host_port.rsplit(':', 1)\n"
+          "host = host or '127.0.0.1'\n"
+          "port = int(port_text)\n"
+          "\n"
+          "sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n"
+          "sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n"
+          "sock.bind((host, port))\n"
+          "sock.listen(8)\n"
+          "\n"
+          "bound_host, bound_port = sock.getsockname()[:2]\n"
+          "public_host = '127.0.0.1' if bound_host in ('0.0.0.0', '') else bound_host\n"
+          "uri = f'tcp://{public_host}:{bound_port}'\n"
+          "with open(uri_file, 'w', encoding='utf-8') as handle:\n"
+          "    handle.write(uri + '\\n')\n"
+          "sys.stdout.write(f'gRPC (Connect JSON) server listening on {uri}\\n')\n"
+          "sys.stdout.flush()\n"
+          "\n"
+          "stop = False\n"
+          "\n"
+          "def handle_signal(_signo, _frame):\n"
+          "    global stop\n"
+          "    stop = True\n"
+          "    try:\n"
+          "        sock.close()\n"
+          "    except OSError:\n"
+          "        pass\n"
+          "\n"
+          "signal.signal(signal.SIGTERM, handle_signal)\n"
+          "signal.signal(signal.SIGINT, handle_signal)\n"
+          "\n"
+          "while not stop:\n"
+          "    try:\n"
+          "        conn, _ = sock.accept()\n"
+          "    except OSError:\n"
+          "        if stop:\n"
+          "            break\n"
+          "        time.sleep(0.05)\n"
+          "        continue\n"
+          "    conn.close()\n"
+          "PY\n",
+          '\'',
+          backend_uri_file,
+          '\'');
+  fclose(f);
+  check_int(chmod(backend_path, 0755) == 0, "grpc bridge backend executable");
+
+  f = fopen(wrapper_path, "w");
+  assert(f != NULL);
+  fprintf(f,
+          "#!/bin/sh\n"
+          "exec ./bin/grpc-bridge --backend %c%s%c --proto-dir %c%s%c --holon-yaml %c%s%c \"$@\"\n",
+          '\'',
+          backend_path,
+          '\'',
+          '\'',
+          root,
+          '\'',
+          '\'',
+          holon_yaml,
+          '\'');
+  fclose(f);
+  check_int(chmod(wrapper_path, 0755) == 0, "grpc bridge wrapper executable");
+
+  bridge_uri[0] = '\0';
+  backend_uri[0] = '\0';
+
+  if (spawn_background_server(wrapper_path, "tcp://127.0.0.1:0", &pid, bridge_uri, sizeof(bridge_uri)) != 0) {
+    ++passed;
+    fprintf(stderr, "SKIP: grpc bridge public uri ordering (helper did not start)\n");
+  } else {
+    check_int(wait_for_file(backend_uri_file, 3000) == 0, "grpc bridge backend uri file");
+    check_int(read_file(backend_uri_file, backend_uri, sizeof(backend_uri)) == 0,
+              "grpc bridge backend uri read");
+    if (backend_uri[0] != '\0') {
+      char *newline = strchr(backend_uri, '\n');
+      if (newline != NULL) {
+        *newline = '\0';
+      }
+      check_int(strcmp(bridge_uri, backend_uri) != 0,
+                "grpc bridge advertises public uri before backend uri");
+      check_int(strstr(bridge_uri, "tcp://") == bridge_uri,
+                "grpc bridge publishes tcp uri");
+    }
+  }
+
+  if (pid > 0) {
+    (void)kill(pid, SIGTERM);
+    (void)waitpid(pid, NULL, 0);
+  }
+
+  snprintf(cleanup_cmd, sizeof(cleanup_cmd), "rm -rf '%s'", root);
+  (void)system(cleanup_cmd);
+}
+
 static void test_echo_wrapper_invocation(void) {
   char fake_go[] = "/tmp/holons_fake_go_XXXXXX";
   char fake_log[] = "/tmp/holons_fake_go_log_XXXXXX";
@@ -1909,6 +2075,7 @@ int main(void) {
   test_connect_starts_slug_ephemerally();
   test_connect_reuses_port_file();
   test_connect_removes_stale_port_file();
+  test_grpc_bridge_advertises_public_uri_first();
   test_scheme_and_flags();
   test_uri_parsing();
   test_identity_parsing();

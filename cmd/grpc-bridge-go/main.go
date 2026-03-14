@@ -55,11 +55,23 @@ type backendProcess struct {
 	stderrTail   string
 	stdoutDoneCh chan struct{}
 	stderrDoneCh chan struct{}
+	logs         *deferredLogger
 }
 
 type lineCollector struct {
 	mu    sync.Mutex
 	lines []string
+}
+
+type deferredLogger struct {
+	mu     sync.Mutex
+	ready  bool
+	buffer []deferredLogLine
+}
+
+type deferredLogLine struct {
+	label string
+	line  string
 }
 
 func (c *lineCollector) append(line string) {
@@ -75,6 +87,29 @@ func (c *lineCollector) text() string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return strings.Join(c.lines, "\n")
+}
+
+func (l *deferredLogger) print(label string, line string) {
+	l.mu.Lock()
+	if l.ready {
+		l.mu.Unlock()
+		log.Printf("%s: %s", label, line)
+		return
+	}
+	l.buffer = append(l.buffer, deferredLogLine{label: label, line: line})
+	l.mu.Unlock()
+}
+
+func (l *deferredLogger) flush() {
+	l.mu.Lock()
+	buffered := append([]deferredLogLine(nil), l.buffer...)
+	l.buffer = nil
+	l.ready = true
+	l.mu.Unlock()
+
+	for _, entry := range buffered {
+		log.Printf("%s: %s", entry.label, entry.line)
+	}
 }
 
 func main() {
@@ -111,12 +146,14 @@ func main() {
 	defer server.Stop()
 
 	if err := describe.Register(server, cfg.protoDir, cfg.holonYAML); err != nil {
+		backend.logs.flush()
 		log.Fatalf("grpc-bridge: register describe: %v", err)
 	}
 	reflection.Register(server)
 
 	listener, err := transport.Listen(cfg.listenURI)
 	if err != nil {
+		backend.logs.flush()
 		log.Fatalf("grpc-bridge: listen: %v", err)
 	}
 	defer listener.Close()
@@ -127,6 +164,7 @@ func main() {
 	}()
 
 	log.Printf("gRPC bridge listening on %s (backend %s)", advertisedURI(cfg.listenURI, listener.Addr()), backend.uri)
+	backend.logs.flush()
 
 	sigCh := make(chan os.Signal, 2)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -294,22 +332,25 @@ func startBackend(binary string) (*backendProcess, error) {
 
 	stdoutCollector := &lineCollector{}
 	stderrCollector := &lineCollector{}
+	logCollector := &deferredLogger{}
 	proc := &backendProcess{
 		cmd:          cmd,
 		stdoutDoneCh: make(chan struct{}),
 		stderrDoneCh: make(chan struct{}),
+		logs:         logCollector,
 	}
 
 	uriCh := make(chan string, 1)
-	readPipe("backend stdout", stdout, stdoutCollector, uriCh, proc.stdoutDoneCh)
-	readPipe("backend stderr", stderr, stderrCollector, nil, proc.stderrDoneCh)
+	readPipe("backend stdout", stdout, stdoutCollector, uriCh, proc.stdoutDoneCh, logCollector)
+	readPipe("backend stderr", stderr, stderrCollector, nil, proc.stderrDoneCh, logCollector)
 
 	select {
 	case uri := <-uriCh:
 		proc.uri = uri
 	case <-time.After(3 * time.Second):
+		proc.logs.flush()
 		_ = proc.stop()
-		return nil, fmt.Errorf("timed out waiting for backend startup")
+		return nil, fmt.Errorf("timed out waiting for backend startup: %s", startupDiagnostics(stdoutCollector.text(), stderrCollector.text()))
 	}
 
 	proc.stdoutTail = stdoutCollector.text()
@@ -317,7 +358,23 @@ func startBackend(binary string) (*backendProcess, error) {
 	return proc, nil
 }
 
-func readPipe(label string, reader io.ReadCloser, collector *lineCollector, uriCh chan<- string, done chan<- struct{}) {
+func startupDiagnostics(stdout string, stderr string) string {
+	parts := []string{}
+	stdout = strings.TrimSpace(stdout)
+	stderr = strings.TrimSpace(stderr)
+	if stdout != "" {
+		parts = append(parts, fmt.Sprintf("stdout=%q", stdout))
+	}
+	if stderr != "" {
+		parts = append(parts, fmt.Sprintf("stderr=%q", stderr))
+	}
+	if len(parts) == 0 {
+		return "no backend logs"
+	}
+	return strings.Join(parts, " ")
+}
+
+func readPipe(label string, reader io.ReadCloser, collector *lineCollector, uriCh chan<- string, done chan<- struct{}, logger *deferredLogger) {
 	go func() {
 		defer close(done)
 		defer reader.Close()
@@ -328,7 +385,9 @@ func readPipe(label string, reader io.ReadCloser, collector *lineCollector, uriC
 		for scanner.Scan() {
 			line := scanner.Text()
 			collector.append(line)
-			log.Printf("%s: %s", label, line)
+			if logger != nil {
+				logger.print(label, line)
+			}
 			if uriCh != nil {
 				if uri := firstTCPURI(line); uri != "" {
 					select {
